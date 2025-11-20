@@ -1,0 +1,129 @@
+/**
+ * @name Alerte Dépassement Budget Mensuel (30 Jours Glissants)
+ * @overview Identifie les campagnes dont la dépense sur 30 jours dépasse le (Budget Quotidien * 30.4).
+ * @author Google_Ads_Expert_Script
+ */
+
+// --- CONFIGURATION ---
+var CONFIG = {
+  // Multiplicateur mensuel officiel Google (30.4). Mettre 30 si vous préférez une vue calendrier stricte.
+  DAYS_MULTIPLIER: 30.4, 
+  // Emails des destinataires
+  RECIPIENT_EMAILS: "EMAIL_ADDRESS", 
+  // Filtrer par libellé de compte (laisser vide pour tout traiter)
+  ACCOUNT_LABEL: "" 
+};
+
+// --- FONCTION PRINCIPALE (MCC) ---
+function main() {
+  var accountSelector = AdsManagerApp.accounts();
+
+  if (CONFIG.ACCOUNT_LABEL !== "") {
+    accountSelector.withCondition("LabelNames CONTAINS '" + CONFIG.ACCOUNT_LABEL + "'");
+  }
+
+  // Optimisation : On execute en parallèle
+  try {
+    accountSelector.executeInParallel("processAccountOverspend", "sendMonthlyReport");
+  } catch (e) {
+    console.error("Erreur critique MCC : " + e.message);
+  }
+}
+
+// --- FONCTION WORKER (Niveau CID) ---
+function processAccountOverspend() {
+  var alerts = [];
+  var accountName = AdsApp.currentAccount().getName();
+  var accountId = AdsApp.currentAccount().getCustomerId();
+
+  // 1. Sélection : Campagnes actives ayant dépensé sur 30 jours
+  var campaignIterator = AdsApp.campaigns()
+      .withCondition("Status = ENABLED")
+      .withCondition("Cost > 0")
+      .forDateRange("LAST_30_DAYS") // Période clé
+      .get();
+
+  while (campaignIterator.hasNext()) {
+    var campaign = campaignIterator.next();
+    var dailyBudget = campaign.getBudget().getAmount();
+    
+    // On récupère les stats des 30 derniers jours
+    var stats = campaign.getStatsFor("LAST_30_DAYS");
+    var costLast30Days = stats.getCost();
+
+    // 2. Calcul du Plafond Théorique Mensuel
+    // Si budget partagé, dailyBudget est celui de la campagne, attention aux nuances.
+    if (dailyBudget > 0) {
+      var theoreticalMonthlyCap = dailyBudget * CONFIG.DAYS_MULTIPLIER;
+
+      // 3. Comparaison : Dépense Réelle vs Capacité Théorique
+      if (costLast30Days > theoreticalMonthlyCap) {
+        var overspend = costLast30Days - theoreticalMonthlyCap;
+        var overspendPercent = ((costLast30Days / theoreticalMonthlyCap) * 100) - 100;
+
+        alerts.push({
+          account: accountName,
+          campaign: campaign.getName(),
+          dailyBudget: dailyBudget,
+          theoreticalCap: theoreticalMonthlyCap,
+          realCost30d: costLast30Days,
+          delta: overspend,
+          percent: overspendPercent.toFixed(1) + "%"
+        });
+      }
+    }
+  }
+
+  return JSON.stringify(alerts);
+}
+
+// --- FONCTION CALLBACK (Reporting) ---
+function sendMonthlyReport(results) {
+  var allAlerts = [];
+  
+  // Agrégation
+  for (var i = 0; i < results.length; i++) {
+    var result = results[i].getReturnValue();
+    if (result) {
+      allAlerts = allAlerts.concat(JSON.parse(result));
+    }
+  }
+
+  // Envoi Email
+  if (allAlerts.length > 0) {
+    // Tri des alertes par pourcentage de dépassement (du plus critique au moins critique)
+    allAlerts.sort(function(a, b) { return parseFloat(b.percent) - parseFloat(a.percent); });
+
+    var emailBody = "<h3>⚠️ Analyse Budget (30 Jours Glissants)</h3>";
+    emailBody += "<p>Les campagnes suivantes ont dépensé plus, sur les 30 derniers jours, que leur budget quotidien actuel ne l'autoriserait théoriquement (" + CONFIG.DAYS_MULTIPLIER + "x).</p>";
+    emailBody += "<p><i>Cause probable : Baisse récente du budget ou sur-diffusion agressive.</i></p>";
+    
+    emailBody += "<table border='1' style='border-collapse: collapse; padding: 5px; font-family: sans-serif; font-size: 12px;'>";
+    emailBody += "<tr style='background-color: #e0e0e0;'>";
+    emailBody += "<th>Compte</th><th>Campagne</th><th>Budget Jour</th><th>Capacité 30J (Théo)</th><th>Coût Réel (30J)</th><th>Dépassement</th>";
+    emailBody += "</tr>";
+
+    for (var j = 0; j < allAlerts.length; j++) {
+      var row = allAlerts[j];
+      emailBody += "<tr>" +
+        "<td>" + row.account + "</td>" +
+        "<td>" + row.campaign + "</td>" +
+        "<td>" + row.dailyBudget.toFixed(2) + "</td>" +
+        "<td style='color:#666;'>" + row.theoreticalCap.toFixed(2) + "</td>" +
+        "<td><b>" + row.realCost30d.toFixed(2) + "</b></td>" +
+        "<td style='color:red; font-weight:bold;'>" + row.percent + "</td>" +
+        "</tr>";
+    }
+    emailBody += "</table>";
+    
+    MailApp.sendEmail({
+      to: CONFIG.RECIPIENT_EMAILS,
+      subject: "[Audit 30J] Dépassements de Capacité Budgétaire detectés",
+      htmlBody: emailBody
+    });
+    
+    console.log("Rapport envoyé : " + allAlerts.length + " cas détectés.");
+  } else {
+    console.log("RAS : Toutes les campagnes sont dans les clous sur 30 jours.");
+  }
+}
